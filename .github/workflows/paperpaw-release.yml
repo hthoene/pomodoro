@@ -1,0 +1,207 @@
+# A release job for a PaperPaw plugin's own repository (copy it to
+# .github/workflows/): when you push a tag `v` + the version of
+# plugin.ini, it makes the GitHub release that paperpaw.org takes the
+# plugin from (a repository with the topic `paperpaw-plugin`; the site
+# lists it as "Community, unreviewed"). The release holds exactly:
+#
+#   my-plugin-1.0.0.zip                   the plugin's folder (always)
+#   my-plugin-1.0.0-x4.ppn                a code plugin's signed builds,
+#   my-plugin-1.0.0-x4-pro.ppn            one for each reader chosen below
+#   my-plugin-1.0.0-x4-classic.ppn        (the X4 Pro's file: the same build)
+#
+# A code plugin is signed with the author's key, kept as the repository's
+# secret PAPERPAW_PLUGIN_KEY (`paperpaw-sign key author.key` makes it
+# once; paste the file's contents as the secret, and keep the file safe
+# and out of every repository). Every version is signed by the same key:
+# the site fixes it at the first version it takes.
+#
+# The build steps are those of samples/hello-native (build.sh and its
+# CI job): the same pinned compilers and the same paths in the build, so
+# the site can rebuild it from the tag and compare. Nothing here runs in
+# PaperPaw's own repository.
+name: paperpaw-release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+  # The switch: "false" for a plugin without code (the folder is zipped
+  # and nothing is built or signed), "true" for a plugin with code.
+  CODE: "true"
+  # The readers a code plugin is built for (the X3 runs the X4's file).
+  # The X4 Classic runs the X4 Pro's file (same chip and fingerprint): it is
+  # published under the Classic's name too, where X4_PRO is built.
+  X4: "true"
+  X4_PRO: "true"
+  X4_CLASSIC: "true"
+
+  # The plugin's folder, the one with plugin.ini at its top (and
+  # store/store.ini and the screenshots in store/). Use "." only when the
+  # repository holds nothing else.
+  PLUGIN_DIR: plugin
+  # A code plugin's binary crate, as in Cargo.toml.
+  BIN: pomodoro
+
+  # A code plugin is built for one PaperPaw release, with its compilers:
+  # a file runs only on firmware built by the same ones (the device's
+  # *About* names them; PaperPaw's shells/xteink/rust-toolchain.toml and
+  # versions.env of that release pin them). RUST_X4 is also this
+  # repository's rust-toolchain.toml.
+  PAPERPAW: "0.5.0-beta.11"
+  RUST_X4: "1.99.0"
+  RUST_X4_PRO: "1.97.0.0"
+  ESP_GCC: "14.2.0_20241119"
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: The tag is the plugin's version
+        run: |
+          set -euo pipefail
+          ini() { sed -n "s/^$1 *= *//p" "$PLUGIN_DIR/plugin.ini" | tr -d '\r' | head -n 1; }
+          [ -f "$PLUGIN_DIR/plugin.ini" ] || { echo "$PLUGIN_DIR/plugin.ini is missing: set PLUGIN_DIR to the plugin's folder" >&2; exit 1; }
+          id=$(ini id)
+          version=$(ini version)
+          [ -n "$id" ] && [ -n "$version" ] || { echo "$PLUGIN_DIR/plugin.ini names no id or version" >&2; exit 1; }
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "the tag is $GITHUB_REF_NAME, $PLUGIN_DIR/plugin.ini says version $version: the tag must be v$version" >&2
+            exit 1
+          fi
+          echo "ID=$id" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # paperpaw-sign of the release checks the repository by the plugin
+      # store's rules (the site's newest, where it answers) before anything
+      # is built: a release the site would refuse is never made.
+      - name: paperpaw-sign, of the release
+        run: |
+          set -euo pipefail
+          if [ "$CODE" = true ]; then toolchain="+$RUST_X4"; rustup toolchain install "$RUST_X4" --profile minimal; else toolchain=""; fi
+          cargo $toolchain install --locked --git https://github.com/hthoene/paperpaw --tag "v$PAPERPAW" paperpaw-sign
+
+      - name: Check it as the plugin store will
+        run: |
+          set -euo pipefail
+          rules=()
+          if curl -sSf --max-time 20 https://paperpaw.org/api/v1/store-rules.json -o "$RUNNER_TEMP/store-rules.json"; then
+            rules=(--rules "$RUNNER_TEMP/store-rules.json")
+          else
+            echo "the site's rules could not be fetched: checked by paperpaw-sign's own"
+          fi
+          echo "RULES=${rules[*]}" >> "$GITHUB_ENV"
+          paperpaw-sign check-publish . --tag "$GITHUB_REF_NAME" "${rules[@]}"
+
+      - name: Zip the plugin's folder
+        run: |
+          set -euo pipefail
+          mkdir release
+          # Without hidden files; store/ stays in, the site takes it out
+          # of what readers install.
+          (cd "$PLUGIN_DIR" && zip -q -X -r -D "$GITHUB_WORKSPACE/release/$ID-$VERSION.zip" . -x '.*' -x '*/.*')
+          unzip -l "release/$ID-$VERSION.zip"
+
+      # From here on, for a plugin with code only.
+      - name: Compilers
+        if: env.CODE == 'true'
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_X4" --profile minimal --target riscv32imc-unknown-none-elf
+          if [ "$X4_PRO" = true ]; then
+            curl -sSfL https://github.com/esp-rs/espup/releases/latest/download/espup-x86_64-unknown-linux-gnu -o "$RUNNER_TEMP/espup"
+            chmod +x "$RUNNER_TEMP/espup"
+            "$RUNNER_TEMP/espup" install --targets esp32s3 --toolchain-version "$RUST_X4_PRO" \
+              --crosstool-toolchain-version "$ESP_GCC"
+          fi
+
+      # The X4 Pro's core libraries, built once by the release and signed
+      # with PaperPaw's release key, into the esp toolchain (as rustup has
+      # the X4's): every build of the plugin is then the same.
+      - name: The X4 Pro's core libraries, of the release
+        if: env.CODE == 'true' && env.X4_PRO == 'true'
+        run: |
+          set -euo pipefail
+          archive="paperpaw-xtensa-std-$PAPERPAW.tar.gz"
+          base="https://github.com/hthoene/paperpaw/releases/download/v$PAPERPAW"
+          curl -sSfL "$base/$archive" -o "$RUNNER_TEMP/$archive"
+          curl -sSfL "$base/$archive.sig" -o "$RUNNER_TEMP/$archive.sig"
+          # PaperPaw's release key, whole (fingerprint 55A9 F626 DB17 EB90).
+          paperpaw-sign check-asset "$RUNNER_TEMP/$archive" "$RUNNER_TEMP/$archive.sig" \
+            | tee /dev/stderr | grep -q "(55a9f626db17eb9058707323d29f52470bfcd09638898e17bd01784ef9df0c51)"
+          sysroot="$(rustc +esp --print sysroot)"
+          rm -rf "$sysroot/lib/rustlib/xtensa-esp32s3-none-elf"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$sysroot"
+
+      - name: Build, pack and sign
+        if: env.CODE == 'true'
+        env:
+          PAPERPAW_PLUGIN_KEY: ${{ secrets.PAPERPAW_PLUGIN_KEY }}
+        run: |
+          set -eo pipefail
+          if [ -z "$PAPERPAW_PLUGIN_KEY" ]; then
+            echo "the repository has no secret PAPERPAW_PLUGIN_KEY: a code plugin is released signed" >&2
+            exit 1
+          fi
+          # The X4 Pro's compiler environment, before -u: espup's file
+          # does not expect it.
+          if [ "$X4_PRO" = true ]; then . "$HOME/export-esp.sh"; fi
+          set -u
+          key="$RUNNER_TEMP/author.key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$PAPERPAW_PLUGIN_KEY" > "$key")
+
+          # The paths in a build written as the same on every computer, as
+          # the site's rebuild writes them: the repository's top as
+          # /plugin and Cargo's home as /cargo (added to the flags of
+          # .cargo/config.toml, which link the plugin: never set RUSTFLAGS).
+          top=$(git rev-parse --show-toplevel)
+          cargo_home=${CARGO_HOME:-$HOME/.cargo}
+          remap() {
+            printf "target.%s.rustflags = ['--remap-path-prefix=%s=/plugin', '--remap-path-prefix=%s=/cargo']" "$1" "$top" "$cargo_home"
+          }
+          pack() {
+            # <target> <device>
+            out="release/$ID-$VERSION-$2.ppn"
+            paperpaw-sign pack "target/$1/release/$BIN" "$out" --key "$key"
+            paperpaw-sign check-plugin "$out"
+            echo "$2: fingerprint $(paperpaw-sign plugin "$out" | sed -n 's/^fingerprint: *//p')"
+          }
+
+          if [ "$X4" = true ]; then
+            cargo x4 --locked --config "$(remap riscv32imc-unknown-none-elf)"
+            pack riscv32imc-unknown-none-elf x4
+          fi
+          if [ "$X4_PRO" = true ]; then
+            cargo +esp x4pro --locked --config "$(remap xtensa-esp32s3-none-elf)"
+            pack xtensa-esp32s3-none-elf x4-pro
+            if [ "$X4_CLASSIC" = true ]; then
+              cp "release/$ID-$VERSION-x4-pro.ppn" "release/$ID-$VERSION-x4-classic.ppn"
+            fi
+          fi
+
+      # The files as the site will read them: names, chips, interface,
+      # signatures, one key. Nothing is released where this fails.
+      - name: Check the release's files
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086
+          paperpaw-sign check-publish . --release-dir release --tag "$GITHUB_REF_NAME" $RULES
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A published release, not a draft and not a pre-release: the site
+        # takes no other. Exactly the files of release/.
+        run: |
+          set -euo pipefail
+          ls -l release
+          gh release create "$GITHUB_REF_NAME" release/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag

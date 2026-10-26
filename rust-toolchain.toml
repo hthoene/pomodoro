@@ -1,0 +1,6 @@
+# The compiler of the PaperPaw release the plugin is built for: a plugin
+# file runs only on firmware built by the same one.
+[toolchain]
+channel = "1.99.0"
+targets = ["riscv32imc-unknown-none-elf"]
+profile = "minimal"

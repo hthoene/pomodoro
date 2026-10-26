@@ -1,0 +1,6 @@
+/target/
+/dist/
+/release/
+# The author's signing key never goes into the repository: keep it
+# outside (e.g. ~/.paperpaw/author.key) and in the CI's secrets.
+*.key

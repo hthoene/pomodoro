@@ -1,0 +1,3 @@
+A Pomodoro timer: work in focused rounds, then rest.
+
+Open it from the tools menu. Start begins the round; the timer keeps running when you leave the screen or the reader sleeps, and a notice tells you when the time is up. While it runs, the minutes left show in status lines. Lengths and the number of rounds before the long break are set under Pomodoro in the settings.

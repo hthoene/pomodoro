@@ -1,0 +1,31 @@
+[package]
+name = "pomodoro"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# A workspace of its own: the file it makes must fit firmware built elsewhere.
+[workspace]
+
+# The plugin, tested and tried in the emulator as a library.
+[lib]
+path = "src/lib.rs"
+
+# The file for the readers: the plugin behind PaperPaw's `plugin!` line.
+[[bin]]
+name = "pomodoro"
+path = "device/main.rs"
+test = false
+bench = false
+
+[dependencies]
+paperpaw-sdk = { version = "=0.5.0-beta.11" }
+
+# As the firmware is built: small code, one unit, no unwinding.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+# Lines in the ELF, for naming the functions of a crash's calls.
+debug = "line-tables-only"

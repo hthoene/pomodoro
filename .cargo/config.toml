@@ -1,0 +1,36 @@
+# How a native plugin is built (PaperPaw's docs/plugins.md): linked with
+# `paperpaw-plugin.x` (the copy beside this folder, as the PaperPaw
+# release has it), its relocations kept for the packer. Keep both as they
+# are: paperpaw.org rebuilds the plugin with them.
+#
+# - The X4 (ESP32-C3, RISC-V): `cargo x4`, with the toolchain the
+#   PaperPaw release names.
+# - The X4 Pro (ESP32-S3, Xtensa): `cargo +esp x4pro`, with espup's `esp`
+#   toolchain and the core libraries of the PaperPaw release
+#   (`paperpaw-xtensa-std-<version>.tar.gz`, installed with PaperPaw's
+#   tools/xtensa-std/install.sh), so that the plugin's code is the same
+#   on every computer.
+[alias]
+x4 = "build --release --target riscv32imc-unknown-none-elf"
+x4pro = "build --release --target xtensa-esp32s3-none-elf"
+
+[target.riscv32imc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-Tpaperpaw-plugin.x",
+    "-C", "link-arg=--emit-relocs",
+    # Keep calls across the hot-code boundary available to the packer.
+    "-C", "link-arg=--no-relax",
+    "-C", "code-model=medium",
+    "-C", "relocation-model=static",
+    "-C", "force-frame-pointers",
+    "--cfg", "paperpaw_plugin",
+]
+
+[target.xtensa-esp32s3-none-elf]
+rustflags = [
+    "-C", "link-arg=-nostartfiles",
+    "-C", "link-arg=-nostdlib",
+    "-C", "link-arg=-Wl,-Tpaperpaw-plugin.x",
+    "-C", "link-arg=-Wl,--emit-relocs",
+    "--cfg", "paperpaw_plugin",
+]

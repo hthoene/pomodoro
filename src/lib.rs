@@ -19,7 +19,9 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use core::cell::RefCell;
 
-use paperpaw_sdk::builtin::{actions, menus};
+use paperpaw_sdk::builtin::{actions, events, menus};
+use paperpaw_sdk::power::WakeHold;
+use paperpaw_sdk::time::unix_seconds;
 use paperpaw_sdk::event::Event;
 use paperpaw_sdk::setting::Setting;
 use paperpaw_sdk::ui::{self, Ink, Label, Stack, TextRole, UiStyle};
@@ -67,9 +69,33 @@ struct State {
     done: i64,
     /// Focus rounds finished since PaperPaw started.
     total: u32,
+    /// Seconds since 1970 when the phase ends, while running: kept so a
+    /// restart can go on where it was.
+    end_unix: Option<i64>,
 }
 
 type Shared = Rc<RefCell<State>>;
+
+/// Where the state is kept, in the plugin's own folder.
+fn save_path() -> String {
+    format!("{}/state.txt", Env::plugin_dir("pomodoro"))
+}
+
+fn phase_code(phase: Phase) -> u8 {
+    match phase {
+        Phase::Focus => 0,
+        Phase::Short => 1,
+        Phase::Long => 2,
+    }
+}
+
+fn phase_from(code: i64) -> Phase {
+    match code {
+        1 => Phase::Short,
+        2 => Phase::Long,
+        _ => Phase::Focus,
+    }
+}
 
 fn minutes(env: &Env<'_>, phase: Phase) -> u64 {
     let m = match phase {
@@ -97,6 +123,63 @@ impl State {
         }
     }
 
+    /// Keeps the state in a small file, so that switching the device off
+    /// does not lose the round.
+    fn save(&self, env: &Env<'_>) {
+        let end = if self.running { self.end_unix.unwrap_or(0) } else { 0 };
+        let text = format!(
+            "{}|{}|{}|{}|{}|{}",
+            phase_code(self.phase),
+            u8::from(self.running),
+            end,
+            self.left_ms,
+            self.done,
+            self.total
+        );
+        let _ = env.storage().write(&save_path(), text.as_bytes());
+    }
+
+    /// Reads the kept state back at start-up. A round that was running
+    /// goes on by the wall clock; one that ended meanwhile moves on.
+    fn load(&mut self, env: &Env<'_>, out: &mut alloc::vec::Vec<Command>) {
+        let mut buf = [0u8; 96];
+        let Ok(n) = env.storage().read_at(&save_path(), 0, &mut buf) else {
+            return;
+        };
+        let Ok(text) = core::str::from_utf8(&buf[..n]) else {
+            return;
+        };
+        let mut parts = text.split('|').map(|p| p.trim().parse::<i64>().ok());
+        let (Some(Some(phase)), Some(Some(running)), Some(Some(end)), Some(Some(left)), Some(Some(done)), Some(Some(total))) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return;
+        };
+        self.phase = phase_from(phase);
+        self.done = done.clamp(0, 99);
+        self.total = total.clamp(0, 100_000) as u32;
+        self.running = false;
+        self.left_ms = (left.max(0) as u64).min(minutes(env, self.phase) * 60_000);
+        if running == 1 && end > 0 {
+            if let Some(now) = unix_seconds(env) {
+                if end > now {
+                    self.left_ms = ((end - now) as u64 * 1000)
+                        .min(minutes(env, self.phase) * 60_000);
+                    self.start(env, out);
+                } else {
+                    // Time ran out while the device was off.
+                    self.running = true;
+                    self.advance(env, true);
+                }
+            }
+        }
+    }
+
     fn start(&mut self, env: &Env<'_>, out: &mut alloc::vec::Vec<Command>) {
         if self.running {
             return;
@@ -104,7 +187,9 @@ impl State {
         self.running = true;
         let end = env.now().add_millis(self.left_ms);
         self.end = Some(end);
+        self.end_unix = unix_seconds(env).map(|s| s + (self.left_ms / 1000) as i64);
         out.push(DONE.schedule((), end));
+        self.save(env);
     }
 
     fn pause(&mut self, env: &Env<'_>, out: &mut alloc::vec::Vec<Command>) {
@@ -114,12 +199,14 @@ impl State {
         self.left_ms = self.remaining(env.now());
         self.running = false;
         out.push(Command::CancelWork(DONE.id().clone(), None));
+        self.save(env);
     }
 
     fn enter(&mut self, env: &Env<'_>, phase: Phase) {
         self.phase = phase;
         self.running = false;
         self.left_ms = minutes(env, phase) * 60_000;
+        self.save(env);
     }
 
     /// The phase after this one.
@@ -175,7 +262,22 @@ impl Plugin for Pomodoro {
             left_ms: 25 * 60_000,
             done: 0,
             total: 0,
+            end_unix: None,
         }));
+
+        // At start-up and on waking: go on where the saved state left off.
+        let s = shared.clone();
+        r.on(events::STARTED, move |env, _, out| {
+            let mut cmds = alloc::vec::Vec::new();
+            s.borrow_mut().load(env, &mut cmds);
+            for c in cmds {
+                out.push(c);
+            }
+        })?;
+        let s = shared.clone();
+        r.on(events::SUSPEND, move |env, _, _| {
+            s.borrow().save(env);
+        })?;
 
         r.add_action(ActionSpec::new(OPEN, "pomodoro.title").handler(|_, _, out| {
             out.push(Command::OpenScreen(SCREEN, Params::new()));
@@ -223,6 +325,15 @@ impl Plugin for Pomodoro {
             false,
             GROUP,
         ))?;
+        r.add_setting(
+            SettingSpec::switch(
+                AWAKE.static_str(),
+                "pomodoro.setting.awake",
+                false,
+                GROUP,
+            )
+            .description("pomodoro.setting.awake.help"),
+        )?;
 
         // Minutes left, in any status line.
         let s = shared.clone();
@@ -249,6 +360,8 @@ impl Plugin for Pomodoro {
 }
 
 const AUTO: Setting<bool> = Setting::new("pomodoro.auto");
+/// Keeps the screen on while a round runs and this screen is open.
+const AWAKE: Setting<bool> = Setting::new("pomodoro.awake");
 
 /// Milliseconds until the screen is drawn again: to the next full minute
 /// of what is left (at least a second), every ten seconds in the last
@@ -312,6 +425,14 @@ impl PomodoroScreen {
         if running {
             let now = cx.env().now();
             cx.wake_at(now.add_millis(next_tick(left)));
+            // Only if the reader asked for it, and only while this screen
+            // is open and the clock runs; the hold ends with the screen.
+            if cx.env().settings().read(&AWAKE) {
+                cx.keep_awake(WakeHold::new(
+                    Id::new_static("pomodoro.awake"),
+                    "pomodoro.setting.awake",
+                ));
+            }
         }
     }
 
@@ -343,6 +464,7 @@ impl PomodoroScreen {
             let _ = was_running;
         }
         cx.command(Command::CancelWork(DONE.id().clone(), None));
+        self.shared.borrow().save(cx.env());
         cx.request_redraw();
         cx.request_refresh(paperpaw_sdk::RefreshMode::Partial);
     }

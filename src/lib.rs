@@ -3,8 +3,9 @@
 //! - The state (phase, end time, rounds) is shared by every part.
 //! - A timer (`Work::at`) ends the phase exactly on time, whatever screen
 //!   is open, and says so with a notice.
-//! - The screen counts down once a second, holds the device awake only
-//!   while it is open, and works by touch and by buttons.
+//! - The screen redraws once a minute (every ten seconds in the last
+//!   minute), never holds the device awake, and works by touch and by
+//!   buttons.
 //! - A status item shows the minutes left anywhere status lines show.
 
 #![no_std]
@@ -17,11 +18,9 @@ use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::String;
 use core::cell::RefCell;
-use core::time::Duration;
 
 use paperpaw_sdk::builtin::{actions, menus};
 use paperpaw_sdk::event::Event;
-use paperpaw_sdk::power::WakeHold;
 use paperpaw_sdk::setting::Setting;
 use paperpaw_sdk::ui::{self, Ink, Label, Stack, TextRole, UiStyle};
 use paperpaw_sdk::widgets::Align;
@@ -36,7 +35,6 @@ pub const OPEN: Id = Id::new_static("pomodoro.open");
 pub const SCREEN: Id = Id::new_static("pomodoro.screen");
 const DONE: Event<()> = Event::new("pomodoro.done");
 const GROUP: Id = Id::new_static("pomodoro.group");
-const HOLD: Id = Id::new_static("pomodoro.hold");
 
 const FOCUS_MIN: Setting<i64> = Setting::new("pomodoro.focus");
 const SHORT_MIN: Setting<i64> = Setting::new("pomodoro.short");
@@ -252,6 +250,30 @@ impl Plugin for Pomodoro {
 
 const AUTO: Setting<bool> = Setting::new("pomodoro.auto");
 
+/// Milliseconds until the screen is drawn again: to the next full minute
+/// of what is left (at least a second), every ten seconds in the last
+/// minute.
+fn next_tick(left_ms: u64) -> u64 {
+    if left_ms <= 60_000 {
+        10_000.min(left_ms.max(1000))
+    } else {
+        let into = left_ms % 60_000;
+        if into == 0 { 60_000 } else { into }.max(1000)
+    }
+}
+
+/// The seconds shown: whole minutes while more than a minute is left, in
+/// steps of ten in the last one, so the clock never claims more than it
+/// redraws.
+fn shown_secs(left_ms: u64) -> u64 {
+    let secs = left_ms.div_ceil(1000);
+    if left_ms > 60_000 {
+        secs.div_ceil(60) * 60
+    } else {
+        secs.div_ceil(10) * 10
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Main,
@@ -279,14 +301,17 @@ impl PomodoroScreen {
         }
     }
 
+    /// Asks for the next redraw as rarely as the display needs: once a
+    /// minute, every ten seconds in the last minute. The device is never
+    /// held awake; the phase's own timer ends it on time.
     fn tick(&self, cx: &mut Cx<'_, '_>) {
-        let running = self.shared.borrow().running;
+        let (running, left) = {
+            let st = self.shared.borrow();
+            (st.running, st.remaining(cx.env().now()))
+        };
         if running {
             let now = cx.env().now();
-            cx.wake_at(now.add_millis(1000));
-            cx.keep_awake(
-                WakeHold::new(HOLD, "pomodoro.hold").lasting(Duration::from_secs(120)),
-            );
+            cx.wake_at(now.add_millis(next_tick(left)));
         }
     }
 
@@ -298,6 +323,8 @@ impl PomodoroScreen {
                 st.pause(cx.env(), &mut cmds);
             } else {
                 st.start(cx.env(), &mut cmds);
+                let note = cx.env().i18n().tr("pomodoro.notice.slow");
+                cmds.push(Command::Notify(String::from(note)));
             }
         }
         for c in cmds {
@@ -349,7 +376,7 @@ impl Screen for PomodoroScreen {
     fn on_timer(&mut self, cx: &mut Cx<'_, '_>) {
         self.tick(cx);
         cx.request_redraw();
-        cx.request_refresh(paperpaw_sdk::RefreshMode::Fast);
+        cx.request_refresh(paperpaw_sdk::RefreshMode::Partial);
     }
 
     fn on_event(&mut self, _event: &Id, _params: &Params, cx: &mut Cx<'_, '_>) {
@@ -378,7 +405,7 @@ impl Screen for PomodoroScreen {
         let st = self.shared.borrow();
         let total_ms = minutes(env, st.phase) * 60_000;
         let left = st.remaining(env.now()).min(total_ms);
-        let secs = left.div_ceil(1000);
+        let secs = shown_secs(left);
         let clock = format!("{:02}:{:02}", secs / 60, secs % 60);
 
         let mut stack = Stack::new(body, style.gap());

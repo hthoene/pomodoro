@@ -1,3 +1,3 @@
 Ein Pomodoro-Timer: in konzentrierten Runden arbeiten, dann pausieren.
 
-Öffne ihn im Werkzeug-Menü. Mit Start beginnt die Runde; der Timer läuft weiter, wenn du den Bildschirm verlässt oder der Reader schläft, und ein Hinweis zeigt dir, wann die Zeit um ist. Solange er läuft, stehen die Restminuten in den Statuszeilen. Längen und Rundenzahl bis zur langen Pause stellst du in den Einstellungen unter Pomodoro ein.
+Öffne ihn im Werkzeug-Menü. Mit Start beginnt die Runde; der Timer läuft weiter, wenn du den Bildschirm verlässt oder der Reader schläft, und ein Hinweis zeigt dir, wann die Zeit um ist. Solange er läuft, stehen die Restminuten in den Statuszeilen. Um Strom zu sparen, zeichnet sich der Bildschirm nur einmal pro Minute neu (in der letzten Minute alle zehn Sekunden) und hält den Reader nie wach. Längen und Rundenzahl bis zur langen Pause stellst du in den Einstellungen unter Pomodoro ein.
